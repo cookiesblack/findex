@@ -1,4 +1,12 @@
-/* File Integrity Checker - With Filter Options */
+/* File Integrity Checker - With Filter Options
+ * 
+ * FIndex - Fast File Integrity Checker
+ * A high-performance, multi-threaded file integrity monitoring tool
+ * 
+ * Author: Edwin Rizal (ewinccm@gmail.com)
+ * License: MIT
+ */
+ 
 #define _GNU_SOURCE
 #define _XOPEN_SOURCE 700
 

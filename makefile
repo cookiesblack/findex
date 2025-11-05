@@ -1,4 +1,6 @@
 # Makefile for FIndex - Fast File Integrity Checker
+# Author: Edwin Rizal (ewinccm@gmail.com)
+# License: MIT
 
 # Compiler and flags
 CC       = gcc
