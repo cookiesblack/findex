@@ -1,4 +1,4 @@
-/* File Integrity Checker - With Filter Options
+/* File Integrity Checker - Enhanced with xxHash64 and Binary DB
  * 
  * FIndex - Fast File Integrity Checker
  * A high-performance, multi-threaded file integrity monitoring tool
@@ -39,42 +39,131 @@ static int USE_COLOR = 0;
 #define FILTER_DELETED  (1 << 2)
 #define FILTER_ALL      (FILTER_NEW | FILTER_MODIFIED | FILTER_DELETED)
 
-/* ========================== CRC32 Implementation ========================== */
-static uint32_t crc_table[256];
-static int crc_init_done = 0;
+/* Binary DB format constants */
+#define DB_MAGIC    0x46494458  /* "FIDX" */
+#define DB_VERSION  1
 
-static void crc32_init(void) {
-    uint32_t poly = 0xEDB88320U;
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t c = i;
-        for (int j = 0; j < 8; j++)
-            c = (c & 1) ? (poly ^ (c >> 1)) : (c >> 1);
-        crc_table[i] = c;
+/* ========================== xxHash64 Implementation ========================== */
+#define XXH_PRIME64_1  0x9E3779B185EBCA87ULL
+#define XXH_PRIME64_2  0xC2B2AE3D27D4EB4FULL
+#define XXH_PRIME64_3  0x165667B19E3779F9ULL
+#define XXH_PRIME64_4  0x85EBCA77C2B2AE63ULL
+#define XXH_PRIME64_5  0x27D4EB2F165667C5ULL
+
+static uint64_t xxh64_rotl(uint64_t x, int r) {
+    return (x << r) | (x >> (64 - r));
+}
+
+static uint64_t xxh64_round(uint64_t acc, uint64_t input) {
+    acc += input * XXH_PRIME64_2;
+    acc = xxh64_rotl(acc, 31);
+    acc *= XXH_PRIME64_1;
+    return acc;
+}
+
+static uint64_t xxh64_merge_round(uint64_t acc, uint64_t val) {
+    val = xxh64_round(0, val);
+    acc ^= val;
+    acc = acc * XXH_PRIME64_1 + XXH_PRIME64_4;
+    return acc;
+}
+
+static uint64_t xxh64(const void *data, size_t len, uint64_t seed) {
+    const uint8_t *p = (const uint8_t*)data;
+    const uint8_t *end = p + len;
+    uint64_t h64;
+    
+    if (len >= 32) {
+        const uint8_t *limit = end - 32;
+        uint64_t v1 = seed + XXH_PRIME64_1 + XXH_PRIME64_2;
+        uint64_t v2 = seed + XXH_PRIME64_2;
+        uint64_t v3 = seed + 0;
+        uint64_t v4 = seed - XXH_PRIME64_1;
+        
+        do {
+            uint64_t k1, k2, k3, k4;
+            memcpy(&k1, p, 8); p += 8;
+            memcpy(&k2, p, 8); p += 8;
+            memcpy(&k3, p, 8); p += 8;
+            memcpy(&k4, p, 8); p += 8;
+            
+            v1 = xxh64_round(v1, k1);
+            v2 = xxh64_round(v2, k2);
+            v3 = xxh64_round(v3, k3);
+            v4 = xxh64_round(v4, k4);
+        } while (p <= limit);
+        
+        h64 = xxh64_rotl(v1, 1) + xxh64_rotl(v2, 7) + xxh64_rotl(v3, 12) + xxh64_rotl(v4, 18);
+        h64 = xxh64_merge_round(h64, v1);
+        h64 = xxh64_merge_round(h64, v2);
+        h64 = xxh64_merge_round(h64, v3);
+        h64 = xxh64_merge_round(h64, v4);
+    } else {
+        h64 = seed + XXH_PRIME64_5;
     }
-    crc_init_done = 1;
+    
+    h64 += (uint64_t)len;
+    
+    while (p + 8 <= end) {
+        uint64_t k1;
+        memcpy(&k1, p, 8);
+        k1 *= XXH_PRIME64_2;
+        k1 = xxh64_rotl(k1, 31);
+        k1 *= XXH_PRIME64_1;
+        h64 ^= k1;
+        h64 = xxh64_rotl(h64, 27) * XXH_PRIME64_1 + XXH_PRIME64_4;
+        p += 8;
+    }
+    
+    if (p + 4 <= end) {
+        uint32_t k1;
+        memcpy(&k1, p, 4);
+        h64 ^= (uint64_t)k1 * XXH_PRIME64_1;
+        h64 = xxh64_rotl(h64, 23) * XXH_PRIME64_2 + XXH_PRIME64_3;
+        p += 4;
+    }
+    
+    while (p < end) {
+        h64 ^= (*p++) * XXH_PRIME64_5;
+        h64 = xxh64_rotl(h64, 11) * XXH_PRIME64_1;
+    }
+    
+    h64 ^= h64 >> 33;
+    h64 *= XXH_PRIME64_2;
+    h64 ^= h64 >> 29;
+    h64 *= XXH_PRIME64_3;
+    h64 ^= h64 >> 32;
+    
+    return h64;
 }
 
-static uint32_t crc32_update(uint32_t crc, const unsigned char *buf, size_t len) {
-    if (!crc_init_done) crc32_init();
-    crc ^= 0xFFFFFFFFU;
-    for (size_t i = 0; i < len; i++)
-        crc = crc_table[(crc ^ buf[i]) & 0xFFU] ^ (crc >> 8);
-    return crc ^ 0xFFFFFFFFU;
-}
-
-static uint32_t crc32_file_fast(const char *path) {
+static uint64_t xxh64_file_fast(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return 0;
     
     unsigned char buf[256 * 1024];
-    uint32_t crc = 0;
+    uint64_t seed = 0;
+    
+    /* For streaming, we use simple approach - read all and hash */
+    /* For production, implement proper streaming xxHash state */
+    size_t total = 0;
+    unsigned char *all_data = NULL;
     ssize_t n;
     
     while ((n = read(fd, buf, sizeof(buf))) > 0) {
-        crc = crc32_update(crc, buf, (size_t)n);
+        all_data = realloc(all_data, total + n);
+        if (!all_data) {
+            close(fd);
+            return 0;
+        }
+        memcpy(all_data + total, buf, n);
+        total += n;
     }
     close(fd);
-    return crc;
+    
+    uint64_t hash = xxh64(all_data, total, seed);
+    free(all_data);
+    return hash;
 }
 
 /* ========================== Media File Detection ========================== */
@@ -117,7 +206,7 @@ typedef struct {
     char *path;
     off_t size;
     time_t mtime;
-    uint32_t crc32;
+    uint64_t hash;
 } Entry;
 
 typedef struct {
@@ -134,7 +223,7 @@ static void el_init(EntryList *el) {
     pthread_mutex_init(&el->lock, NULL);
 }
 
-static void el_push(EntryList *el, const char *path, off_t size, time_t mtime, uint32_t crc) {
+static void el_push(EntryList *el, const char *path, off_t size, time_t mtime, uint64_t hash) {
     pthread_mutex_lock(&el->lock);
     
     if (el->len == el->cap) {
@@ -149,7 +238,7 @@ static void el_push(EntryList *el, const char *path, off_t size, time_t mtime, u
     el->items[el->len].path = strdup(path);
     el->items[el->len].size = size;
     el->items[el->len].mtime = mtime;
-    el->items[el->len].crc32 = crc;
+    el->items[el->len].hash = hash;
     el->len++;
     
     pthread_mutex_unlock(&el->lock);
@@ -365,8 +454,8 @@ static void *worker_fn(void *arg) {
             continue;
         }
         
-        uint32_t crc = crc32_file_fast(path);
-        el_push(wa->out, path, st.st_size, st.st_mtime, crc);
+        uint64_t hash = xxh64_file_fast(path);
+        el_push(wa->out, path, st.st_size, st.st_mtime, hash);
         free(path);
         
         pthread_mutex_lock(&progress_lock);
@@ -376,22 +465,51 @@ static void *worker_fn(void *arg) {
     return NULL;
 }
 
-/* ========================== Database I/O ========================== */
+/* ========================== Binary Database I/O ========================== */
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t entry_count;
+    uint64_t string_table_size;
+} DBHeader;
+
 static int write_db(const char *dbfile, const EntryList *el) {
-    FILE *f = fopen(dbfile, "w");
+    FILE *f = fopen(dbfile, "wb");
     if (!f) {
         perror("fopen");
         return -1;
     }
     
-    fprintf(f, "path,size,mtime,crc32\n");
+    /* Calculate string table size */
+    uint64_t str_size = 0;
     for (size_t i = 0; i < el->len; i++) {
-        fprintf(f, "%s,%lld,%ld,0x%08x\n",
-                el->items[i].path,
-                (long long)el->items[i].size,
-                (long)el->items[i].mtime,
-                el->items[i].crc32);
+        str_size += strlen(el->items[i].path) + 1;
     }
+    
+    /* Write header */
+    DBHeader hdr = {
+        .magic = DB_MAGIC,
+        .version = DB_VERSION,
+        .entry_count = el->len,
+        .string_table_size = str_size
+    };
+    fwrite(&hdr, sizeof(DBHeader), 1, f);
+    
+    /* Write entries (without path strings) */
+    for (size_t i = 0; i < el->len; i++) {
+        uint32_t path_len = strlen(el->items[i].path);
+        fwrite(&path_len, sizeof(uint32_t), 1, f);
+        fwrite(&el->items[i].size, sizeof(off_t), 1, f);
+        fwrite(&el->items[i].mtime, sizeof(time_t), 1, f);
+        fwrite(&el->items[i].hash, sizeof(uint64_t), 1, f);
+    }
+    
+    /* Write string table */
+    for (size_t i = 0; i < el->len; i++) {
+        uint32_t len = strlen(el->items[i].path);
+        fwrite(el->items[i].path, 1, len, f);
+    }
+    
     fclose(f);
     return 0;
 }
@@ -401,47 +519,77 @@ static int cmp_entry_by_path(const void *a, const void *b) {
 }
 
 static int read_db(const char *dbfile, EntryList *out) {
-    FILE *f = fopen(dbfile, "r");
+    FILE *f = fopen(dbfile, "rb");
     if (!f) return -1;
     
     el_init(out);
-    char *line = NULL;
-    size_t cap = 0;
-    ssize_t n;
     
-    /* Skip header - check return value to suppress warning */
-    n = getline(&line, &cap, f);
-    (void)n; /* Suppress unused variable warning */
-    
-    while ((n = getline(&line, &cap, f)) != -1) {
-        if (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r'))
-            line[--n] = '\0';
-        
-        char *p = line, *tok;
-        
-        tok = strsep(&p, ",");
-        if (!tok) continue;
-        char *path = strdup(tok);
-        
-        tok = strsep(&p, ",");
-        if (!tok) { free(path); continue; }
-        long long size = atoll(tok);
-        
-        tok = strsep(&p, ",");
-        if (!tok) { free(path); continue; }
-        long mtime = atol(tok);
-        
-        tok = strsep(&p, ",");
-        if (!tok) { free(path); continue; }
-        unsigned int crc = 0;
-        sscanf(tok, "0x%x", &crc);
-        
-        el_push(out, path, (off_t)size, (time_t)mtime, (uint32_t)crc);
-        free(path);
+    /* Read header */
+    DBHeader hdr;
+    if (fread(&hdr, sizeof(DBHeader), 1, f) != 1) {
+        fclose(f);
+        return -1;
     }
     
-    free(line);
+    if (hdr.magic != DB_MAGIC) {
+        fprintf(stderr, "Invalid database magic number\n");
+        fclose(f);
+        return -1;
+    }
+    
+    if (hdr.version != DB_VERSION) {
+        fprintf(stderr, "Unsupported database version: %u\n", hdr.version);
+        fclose(f);
+        return -1;
+    }
+    
+    /* Read entries metadata */
+    typedef struct {
+        uint32_t path_len;
+        off_t size;
+        time_t mtime;
+        uint64_t hash;
+    } EntryMeta;
+    
+    EntryMeta *metas = malloc(sizeof(EntryMeta) * hdr.entry_count);
+    if (!metas) {
+        fclose(f);
+        return -1;
+    }
+    
+    for (uint64_t i = 0; i < hdr.entry_count; i++) {
+        fread(&metas[i].path_len, sizeof(uint32_t), 1, f);
+        fread(&metas[i].size, sizeof(off_t), 1, f);
+        fread(&metas[i].mtime, sizeof(time_t), 1, f);
+        fread(&metas[i].hash, sizeof(uint64_t), 1, f);
+    }
+    
+    /* Read string table */
+    char *str_table = malloc(hdr.string_table_size);
+    if (!str_table) {
+        free(metas);
+        fclose(f);
+        return -1;
+    }
+    fread(str_table, 1, hdr.string_table_size, f);
+    
+    /* Build entries */
+    uint64_t str_offset = 0;
+    for (uint64_t i = 0; i < hdr.entry_count; i++) {
+        char *path = malloc(metas[i].path_len + 1);
+        memcpy(path, str_table + str_offset, metas[i].path_len);
+        path[metas[i].path_len] = '\0';
+        
+        el_push(out, path, metas[i].size, metas[i].mtime, metas[i].hash);
+        
+        free(path);
+        str_offset += metas[i].path_len;
+    }
+    
+    free(str_table);
+    free(metas);
     fclose(f);
+    
     qsort(out->items, out->len, sizeof(Entry), cmp_entry_by_path);
     return 0;
 }
@@ -473,16 +621,16 @@ static void do_diff(const EntryList *oldL, const EntryList *curL, int filter, FI
         if (cmp == 0) {
             const Entry *o = &oldL->items[i];
             const Entry *c = &curL->items[j];
-            if (o->size != c->size || o->mtime != c->mtime || o->crc32 != c->crc32) {
+            if (o->size != c->size || o->mtime != c->mtime || o->hash != c->hash) {
                 if (filter & FILTER_MODIFIED) {
                     printf("%s! MODIFIED:%s %s\n", C_YELLOW, C_RESET, c->path);
                 }
                 if (logfile) {
                     fprintf(logfile, "! MODIFIED: %s\n", c->path);
-                    fprintf(logfile, "  Old: size=%lld mtime=%ld crc=0x%08x\n", 
-                            (long long)o->size, (long)o->mtime, o->crc32);
-                    fprintf(logfile, "  New: size=%lld mtime=%ld crc=0x%08x\n",
-                            (long long)c->size, (long)c->mtime, c->crc32);
+                    fprintf(logfile, "  Old: size=%lld mtime=%ld hash=0x%016llx\n", 
+                            (long long)o->size, (long)o->mtime, (unsigned long long)o->hash);
+                    fprintf(logfile, "  New: size=%lld mtime=%ld hash=0x%016llx\n",
+                            (long long)c->size, (long)c->mtime, (unsigned long long)c->hash);
                 }
                 modc++;
             }
@@ -502,10 +650,10 @@ static void do_diff(const EntryList *oldL, const EntryList *curL, int filter, FI
                 printf("%s+ NEW:%s %s\n", C_GREEN, C_RESET, curL->items[j].path);
             }
             if (logfile) {
-                fprintf(logfile, "+ NEW: %s (size=%lld crc=0x%08x)\n",
+                fprintf(logfile, "+ NEW: %s (size=%lld hash=0x%016llx)\n",
                         curL->items[j].path,
                         (long long)curL->items[j].size,
-                        curL->items[j].crc32);
+                        (unsigned long long)curL->items[j].hash);
             }
             newc++;
             j++;
@@ -534,7 +682,7 @@ static void usage(const char *prog) {
         "  %s --check   [--db FILE] [--threads N] [--filter FILTER] [--log FILE]\n"
         "  %s --reindex [--db FILE] [--threads N] [--exclude-media]\n\n"
         "Options:\n"
-        "  --index          Create initial file database\n"
+        "  --index          Create initial file database (binary format)\n"
         "  --check          Compare current files against database\n"
         "  --reindex        Rebuild the database (same as --index)\n"
         "  --db FILE        Database file (default: findex.db)\n"
@@ -617,7 +765,7 @@ int main(int argc, char **argv) {
     /* Handle --index or --reindex */
     if (strcmp(mode, "index") == 0 || strcmp(mode, "reindex") == 0) {
         int include_media = !exclude_media;
-        printf("%sIndexing (fast, %d threads, media %s)...%s\n", 
+        printf("%sIndexing with xxHash64 (%d threads, media %s)...%s\n", 
                C_CYAN, threads, include_media ? "included" : "excluded", C_RESET);
         
         EntryList cur;
@@ -659,8 +807,16 @@ int main(int argc, char **argv) {
         
         /* Sort and save */
         qsort(cur.items, cur.len, sizeof(Entry), cmp_entry_by_path);
-        write_db(dbfile, &cur);
-        printf("Saved to %s\n", dbfile);
+        
+        printf("Writing binary database...\n");
+        if (write_db(dbfile, &cur) == 0) {
+            struct stat st;
+            if (stat(dbfile, &st) == 0) {
+                printf("Saved to %s (%.2f KB)\n", dbfile, st.st_size / 1024.0);
+            } else {
+                printf("Saved to %s\n", dbfile);
+            }
+        }
         
         /* Cleanup */
         pq_free(&q);
@@ -679,10 +835,14 @@ int main(int argc, char **argv) {
         }
         
         EntryList oldL;
+        printf("Reading binary database...\n");
         if (read_db(dbfile, &oldL) != 0) {
             fprintf(stderr, "Cannot read DB: %s\n", dbfile);
+            fprintf(stderr, "Run with --index first to create the database.\n");
             return 1;
         }
+        
+        printf("Loaded %zu entries from database\n", oldL.len);
         
         /* Open log file */
         FILE *logfile = fopen(logfile_path, "a");
@@ -694,7 +854,7 @@ int main(int argc, char **argv) {
             printf("Logging to: %s\n", logfile_path);
         }
         
-        printf("%sScanning current filesystem (fast, %d threads, filter: %s)...%s\n",
+        printf("%sScanning current filesystem with xxHash64 (%d threads, filter: %s)...%s\n",
                C_CYAN, threads, filter_str, C_RESET);
         
         EntryList cur;
