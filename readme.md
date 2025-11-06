@@ -311,7 +311,7 @@ Created for fast, reliable file integrity monitoring.
 
 ## Changelog
 
-### v1.0.0
+### v1.3.0
 - Multi-threaded scanning
 - CRC32 checksums
 - Progress indicator
@@ -319,3 +319,5 @@ Created for fast, reliable file integrity monitoring.
 - Filter options
 - Log file support
 - Media file exclusion
+- xxHash64 checksums
+- Binary database

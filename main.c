@@ -622,6 +622,15 @@ static void do_diff(const EntryList *oldL, const EntryList *curL, int filter, FI
     size_t i = 0, j = 0;
     size_t newc = 0, modc = 0, delc = 0;
     
+    /* Calculate statistics */
+    off_t total_new_size = 0, total_old_size = 0, total_cur_size = 0;
+    for (size_t i = 0; i < curL->len; i++) {
+        total_cur_size += curL->items[i].size;
+    }
+    for (size_t i = 0; i < oldL->len; i++) {
+        total_old_size += oldL->items[i].size;
+    }
+    
     /* Write log header with timestamp */
     if (logfile) {
         time_t now = time(NULL);
@@ -629,6 +638,10 @@ static void do_diff(const EntryList *oldL, const EntryList *curL, int filter, FI
         strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
         fprintf(logfile, "\n========================================\n");
         fprintf(logfile, "Check performed: %s\n", timestamp);
+        fprintf(logfile, "Database files: %zu (%.2f MB)\n", 
+                oldL->len, total_old_size / (1024.0 * 1024.0));
+        fprintf(logfile, "Current files: %zu (%.2f MB)\n", 
+                curL->len, total_cur_size / (1024.0 * 1024.0));
         fprintf(logfile, "========================================\n");
     }
     
@@ -689,10 +702,19 @@ static void do_diff(const EntryList *oldL, const EntryList *curL, int filter, FI
            C_YELLOW, modc, C_RESET,
            C_RED, delc, C_RESET);
     
+    if (newc > 0) {
+        printf("  New files total size: %.2f MB\n", total_new_size / (1024.0 * 1024.0));
+    }
+    
     if (logfile) {
         fprintf(logfile, "----------------------------------------\n");
         fprintf(logfile, "Summary: +%zu new, !%zu modified, -%zu deleted\n",
                 newc, modc, delc);
+        if (newc > 0) {
+            fprintf(logfile, "New files total size: %.2f MB (%.2f GB)\n",
+                    total_new_size / (1024.0 * 1024.0),
+                    total_new_size / (1024.0 * 1024.0 * 1024.0));
+        }
         fflush(logfile);
     }
 }
@@ -700,6 +722,10 @@ static void do_diff(const EntryList *oldL, const EntryList *curL, int filter, FI
 /* ========================== Main Program ========================== */
 static void usage(const char *prog) {
     fprintf(stderr,
+        "FIndex - Fast File Integrity Checker\n"
+        "A high-performance, multi-threaded file integrity monitoring tool\n"
+        "Author: Edwin Rizal (ewinccm@gmail.com)\n"
+        "License: MIT\n\n"
         "Usage:\n"
         "  %s --index   [--db FILE] [--threads N] [--exclude-media]\n"
         "  %s --check   [--db FILE] [--threads N] [--filter FILTER] [--log FILE]\n"
@@ -719,10 +745,6 @@ static void usage(const char *prog) {
         "                   - deleted:  Show only deleted files\n"
         "                   - all:      Show all changes\n"
         "                   - created:  Show new and modified files (default)\n\n"
-        "Features:\n"
-        "  - xxHash64 for fast, high-quality checksums\n"
-        "  - Binary database format for faster I/O\n"
-        "  - Multi-threaded file scanning\n\n"
         "Note: --check always uses the same media inclusion as the database was created with.\n",
         prog, prog, prog);
 }
@@ -832,10 +854,17 @@ int main(int argc, char **argv) {
         printf("\nCollected %zu files (media %s)\n", 
                cur.len, include_media ? "included" : "excluded");
         
+        /* Calculate total size */
+        off_t total_size = 0;
+        for (size_t i = 0; i < cur.len; i++) {
+            total_size += cur.items[i].size;
+        }
+        
         /* Sort and save */
         qsort(cur.items, cur.len, sizeof(Entry), cmp_entry_by_path);
         
         printf("Writing binary database...\n");
+        time_t index_time = time(NULL);
         if (write_db(dbfile, &cur) == 0) {
             struct stat st;
             if (stat(dbfile, &st) == 0) {
@@ -843,6 +872,19 @@ int main(int argc, char **argv) {
             } else {
                 printf("Saved to %s\n", dbfile);
             }
+            
+            /* Summary */
+            printf("\n%s========================================%s\n", C_CYAN, C_RESET);
+            printf("Index Summary:\n");
+            printf("  Files indexed: %zu\n", cur.len);
+            printf("  Total size: %.2f MB (%.2f GB)\n", 
+                   total_size / (1024.0 * 1024.0),
+                   total_size / (1024.0 * 1024.0 * 1024.0));
+            
+            char timestamp[64];
+            strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&index_time));
+            printf("  Timestamp: %s\n", timestamp);
+            printf("%s========================================%s\n", C_CYAN, C_RESET);
         }
         
         /* Cleanup */
