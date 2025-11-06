@@ -5,13 +5,13 @@ A high-performance, multi-threaded file integrity monitoring tool that uses CRC3
 ## Features
 
 - ⚡ **Multi-threaded scanning** - Utilizes all available CPU cores
-- 🔍 **CRC32 checksums** - Fast and reliable file integrity verification
 - 📊 **Progress indicator** - Real-time progress with animated spinner
 - 🎨 **Color output** - Clear, colored diff output (auto-detects TTY)
 - 📝 **Detailed logging** - Comprehensive log file with timestamps
 - 🎯 **Flexible filtering** - Show only new, modified, deleted, or all changes
 - 🖼️ **Media file handling** - Option to exclude media files from indexing
-- 💾 **CSV database** - Human-readable database format
+- 🔍 **xxHash64 checksums** - for fast, high-quality checksums (new)
+- 💾 **Binary database** - Binary database format for faster I/O\n (new)
 
 ## Installation
 

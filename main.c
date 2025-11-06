@@ -480,10 +480,10 @@ static int write_db(const char *dbfile, const EntryList *el) {
         return -1;
     }
     
-    /* Calculate string table size */
+    /* Calculate string table size (no null terminators) */
     uint64_t str_size = 0;
     for (size_t i = 0; i < el->len; i++) {
-        str_size += strlen(el->items[i].path) + 1;
+        str_size += strlen(el->items[i].path);
     }
     
     /* Write header */
@@ -493,21 +493,33 @@ static int write_db(const char *dbfile, const EntryList *el) {
         .entry_count = el->len,
         .string_table_size = str_size
     };
-    fwrite(&hdr, sizeof(DBHeader), 1, f);
+    if (fwrite(&hdr, sizeof(DBHeader), 1, f) != 1) {
+        fprintf(stderr, "Error writing header\n");
+        fclose(f);
+        return -1;
+    }
     
     /* Write entries (without path strings) */
     for (size_t i = 0; i < el->len; i++) {
         uint32_t path_len = strlen(el->items[i].path);
-        fwrite(&path_len, sizeof(uint32_t), 1, f);
-        fwrite(&el->items[i].size, sizeof(off_t), 1, f);
-        fwrite(&el->items[i].mtime, sizeof(time_t), 1, f);
-        fwrite(&el->items[i].hash, sizeof(uint64_t), 1, f);
+        if (fwrite(&path_len, sizeof(uint32_t), 1, f) != 1 ||
+            fwrite(&el->items[i].size, sizeof(off_t), 1, f) != 1 ||
+            fwrite(&el->items[i].mtime, sizeof(time_t), 1, f) != 1 ||
+            fwrite(&el->items[i].hash, sizeof(uint64_t), 1, f) != 1) {
+            fprintf(stderr, "Error writing entry metadata\n");
+            fclose(f);
+            return -1;
+        }
     }
     
     /* Write string table */
     for (size_t i = 0; i < el->len; i++) {
         uint32_t len = strlen(el->items[i].path);
-        fwrite(el->items[i].path, 1, len, f);
+        if (fwrite(el->items[i].path, 1, len, f) != len) {
+            fprintf(stderr, "Error writing string table\n");
+            fclose(f);
+            return -1;
+        }
     }
     
     fclose(f);
@@ -558,10 +570,15 @@ static int read_db(const char *dbfile, EntryList *out) {
     }
     
     for (uint64_t i = 0; i < hdr.entry_count; i++) {
-        fread(&metas[i].path_len, sizeof(uint32_t), 1, f);
-        fread(&metas[i].size, sizeof(off_t), 1, f);
-        fread(&metas[i].mtime, sizeof(time_t), 1, f);
-        fread(&metas[i].hash, sizeof(uint64_t), 1, f);
+        if (fread(&metas[i].path_len, sizeof(uint32_t), 1, f) != 1 ||
+            fread(&metas[i].size, sizeof(off_t), 1, f) != 1 ||
+            fread(&metas[i].mtime, sizeof(time_t), 1, f) != 1 ||
+            fread(&metas[i].hash, sizeof(uint64_t), 1, f) != 1) {
+            fprintf(stderr, "Error reading entry metadata\n");
+            free(metas);
+            fclose(f);
+            return -1;
+        }
     }
     
     /* Read string table */
@@ -571,7 +588,13 @@ static int read_db(const char *dbfile, EntryList *out) {
         fclose(f);
         return -1;
     }
-    fread(str_table, 1, hdr.string_table_size, f);
+    if (fread(str_table, 1, hdr.string_table_size, f) != hdr.string_table_size) {
+        fprintf(stderr, "Error reading string table\n");
+        free(str_table);
+        free(metas);
+        fclose(f);
+        return -1;
+    }
     
     /* Build entries */
     uint64_t str_offset = 0;
@@ -696,6 +719,10 @@ static void usage(const char *prog) {
         "                   - deleted:  Show only deleted files\n"
         "                   - all:      Show all changes\n"
         "                   - created:  Show new and modified files (default)\n\n"
+        "Features:\n"
+        "  - xxHash64 for fast, high-quality checksums\n"
+        "  - Binary database format for faster I/O\n"
+        "  - Multi-threaded file scanning\n\n"
         "Note: --check always uses the same media inclusion as the database was created with.\n",
         prog, prog, prog);
 }
